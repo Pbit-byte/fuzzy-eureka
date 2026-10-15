@@ -1,0 +1,1690 @@
+const { addonBuilder, getRouter } = require('stremio-addon-sdk');
+const express = require('express');
+const axios = require('axios');
+const crypto = require('crypto');
+const dns = require('dns');
+const net = require('net');
+const { AsyncLocalStorage } = require('async_hooks');
+
+// API key gratuita de TMDB (mismo proyecto que usás en el addon de LaMovie,
+// se puede reusar la misma key sin problema). Se usa para conseguir el ID de
+// TMDB de forma confiable por IMDb ID, ya que Poseidon usa ese mismo ID
+// numérico en sus URLs (/serie/94997/..., /pelicula/1368337/...).
+const TMDB_API_KEY = process.env.TMDB_API_KEY || '';
+
+// Convierte un título a slug tipo URL (ej: "La muerte de Robin Hood" ->
+// "la-muerte-de-robin-hood"), transliterando acentos/ñ en vez de perderlos.
+function slugify(text) {
+    if (!text) return '';
+    let s = text.toLowerCase();
+    const accents = { 'á':'a','é':'e','í':'i','ó':'o','ú':'u','ü':'u','à':'a','è':'e','ì':'i','ò':'o','ù':'u','ñ':'n','ç':'c' };
+    for (const [accented, plain] of Object.entries(accents)) {
+        s = s.split(accented).join(plain);
+    }
+    s = s.replace(/[^a-z0-9\s-]/g, '');
+    s = s.replace(/[\s-]+/g, '-').replace(/^-+|-+$/g, '');
+    return s;
+}
+
+async function getTmdbId(imdbId, type) {
+    if (!TMDB_API_KEY) return { id: null, esTitle: null };
+    try {
+        const resp = await axios.get(`https://api.themoviedb.org/3/find/${imdbId}`, {
+            params: { api_key: TMDB_API_KEY, external_source: 'imdb_id', language: 'es-MX' },
+            timeout: 6000
+        });
+        const key = type === 'series' ? 'tv_results' : 'movie_results';
+        const results = resp.data && resp.data[key];
+        if (results && results.length > 0) {
+            const item = results[0];
+            const esTitle = item.title || item.name || null;
+            return { id: String(item.id), esTitle };
+        }
+        return { id: null, esTitle: null };
+    } catch (e) {
+        console.log('Error consultando TMDB find:', e.message);
+        return { id: null, esTitle: null };
+    }
+}
+const puppeteer = require('puppeteer');
+const { URL } = require('url');
+
+// ---------------------------------------------------------------------------
+// Configuración obligatoria del gateway. Si falta algo, el servidor NO arranca.
+//   GATEWAY_SECRET     = el mismo valor que en el Worker
+//   PROXY_SIGNING_KEY  = el mismo valor que en el Worker
+//   PLAYLIST_BASE_URL  = https://<tu-worker>.workers.dev/hls/shen   (sin barra final)
+// Las playlists se entregan por el gateway (la antigua variable de URL pública ya no se usa).
+// ---------------------------------------------------------------------------
+const GATEWAY_SECRET = process.env.GATEWAY_SECRET || '';
+const PROXY_SIGNING_KEY = process.env.PROXY_SIGNING_KEY || '';
+const PLAYLIST_BASE_URL = (process.env.PLAYLIST_BASE_URL || '').replace(/\/+$/, '');
+{
+    const problems = [];
+    if (GATEWAY_SECRET.length < 16) problems.push('GATEWAY_SECRET (mínimo 16 caracteres)');
+    if (PROXY_SIGNING_KEY.length < 16) problems.push('PROXY_SIGNING_KEY (mínimo 16 caracteres)');
+    if (!/^https:\/\/[^/]+\/hls\/[a-z0-9_-]+$/.test(PLAYLIST_BASE_URL)) problems.push('PLAYLIST_BASE_URL (debe ser https://<gateway>/hls/<addon>, sin barra final)');
+    if (problems.length) {
+        console.error('Configuración inválida o incompleta: ' + problems.join(', '));
+        process.exit(1);
+    }
+}
+const ENABLE_DEBUG = process.env.ENABLE_DEBUG === '1';
+
+// Cuenta (X-Account-Id, la pone el gateway) de la petición en curso. El manejador de streams
+// del SDK solo recibe `args`, así que la cuenta viaja por el contexto asíncrono de la petición.
+const acctStore = new AsyncLocalStorage();
+
+// ---------------------------------------------------------------------------
+// Protección contra SSRF SOLO en los dos proxies de HLS (no toca a los resolvers):
+// nunca se conecta a localhost / IPs privadas, ni tras redirects ni por DNS engañoso.
+// ---------------------------------------------------------------------------
+function isPrivateIp(ip) {
+    if (net.isIPv4(ip)) {
+        const [a, b] = ip.split('.').map(Number);
+        return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) ||
+            (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) ||
+            (a === 100 && b >= 64 && b <= 127) || a >= 224;
+    }
+    if (net.isIPv6(ip)) {
+        const x = ip.toLowerCase();
+        if (x === '::1' || x === '::') return true;
+        if (x.startsWith('fe80') || x.startsWith('fc') || x.startsWith('fd') || x.startsWith('ff')) return true;
+        const m4 = x.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+        if (m4) return isPrivateIp(m4[1]);
+        const mh = x.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+        if (mh) {
+            const hi = parseInt(mh[1], 16), lo = parseInt(mh[2], 16);
+            return isPrivateIp(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`);
+        }
+        return false;
+    }
+    return true; // no es una IP válida
+}
+function assertPublicTarget(rawUrl) {
+    let u;
+    try { u = new URL(rawUrl); } catch (e) { throw new Error('URL inválida'); }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('Protocolo no permitido');
+    const host = u.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+    if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal')) {
+        throw new Error('Destino no permitido');
+    }
+    if (net.isIP(host) && isPrivateIp(host)) throw new Error('Destino no permitido');
+}
+async function assertPublicTargetDns(rawUrl) {
+    assertPublicTarget(rawUrl);
+    const host = new URL(rawUrl).hostname.replace(/^\[|\]$/g, '');
+    if (net.isIP(host)) return;
+    const addrs = await dns.promises.lookup(host, { all: true });
+    if (!addrs.length || addrs.some((x) => isPrivateIp(x.address))) throw new Error('Destino no permitido');
+}
+// Opciones por petición (no globales): pocos redirects y cada salto se revisa.
+const PROXY_NET_OPTS = {
+    maxRedirects: 3,
+    beforeRedirect: (options) => {
+        assertPublicTarget(`${options.protocol || 'https:'}//${options.hostname || options.host}`);
+    }
+};
+
+const PS_UA = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' };
+
+// ==========================================
+// UTILIDADES Y FUNCIONES PURAS
+// ==========================================
+function unpackJsVh(p, a, c, k) {
+    while (c--) {
+        if (k[c]) p = p.replace(new RegExp('\\b' + c.toString(a) + '\\b', 'g'), k[c]);
+    }
+    return p;
+}
+
+function makeAbsoluteVh(url, base) {
+    if (!url) return null;
+    if (/^https?:\/\//i.test(url)) return url;
+    if (url.indexOf('//') === 0) return 'https:' + url;
+    if (url.indexOf('/') === 0) {
+        // Path absoluto desde la raíz del dominio (empieza con "/"): hay que
+        // resolverlo contra el ORIGEN (protocolo+host), no contra el directorio
+        // completo de "base" — si no, el path del directorio queda duplicado
+        // (ej: ".../carpeta/carpeta/archivo.ts" en vez de ".../carpeta/archivo.ts").
+        try {
+            return new URL(base).origin + url;
+        } catch (e) {
+            return base + url;
+        }
+    }
+    return base + '/' + url;
+}
+
+function parseJsObjVh(str) {
+    try {
+        var clean = str
+            .replace(/([{,]\s*)([a-zA-Z0-9_]+)\s*:/g, '$1"$2":')
+            .replace(/:\s*'([^']*)'/g, ':"$1"')
+            .replace(/,\s*\}/g, '}');
+        return JSON.parse(clean);
+    } catch(e) {}
+    return null;
+}
+
+// Los embeds (vidhide / streamwish y clones) traen varios links en el mismo
+// objeto: hls4 = /stream/... en el dominio del propio embed (el que usa el
+// reproductor en el navegador; sus segmentos son públicos), hls3 = CDN de
+// StreamWish con playlists .txt y segmentos .woff2, hls2 = CDN firmado con
+// token atado a la red que pidió el embed (el que más falla). Antes se
+// devolvía el PRIMERO que apareciera, y el orden cambia entre pedidos.
+var HLS_KEY_PREFERENCE = ['hls4', 'hls3', 'hls2'];
+function isHlsLikeUrl(v) {
+    return typeof v === 'string' && /\.(?:m3u8|txt)(?:\?|#|$)/i.test(v);
+}
+function pickPreferredHls(obj, base) {
+    if (!obj) return null;
+    for (var i = 0; i < HLS_KEY_PREFERENCE.length; i++) {
+        var v = obj[HLS_KEY_PREFERENCE[i]];
+        if (isHlsLikeUrl(v)) return makeAbsoluteVh(v.replace(/\\\//g, '/'), base);
+    }
+    return null;
+}
+
+function extractM3u8FromObjVh(obj, base) {
+    if (!obj) return null;
+    var preferred = pickPreferredHls(obj, base);
+    if (preferred) return preferred;
+    var keys = Object.keys(obj);
+    for (var i = 0; i < keys.length; i++) {
+        var v = obj[keys[i]];
+        if (v && typeof v === 'string' && v.indexOf('master.m3u8') !== -1) return makeAbsoluteVh(v, base);
+    }
+    for (var j = 0; j < keys.length; j++) {
+        var v2 = obj[keys[j]];
+        if (v2 && typeof v2 === 'string' && v2.indexOf('.m3u8') !== -1) return makeAbsoluteVh(v2, base);
+    }
+    for (var k = 0; k < keys.length; k++) {
+        var v3 = obj[keys[k]];
+        if (v3 && typeof v3 === 'string' && v3.indexOf('/hls/') !== -1) return makeAbsoluteVh(v3, base);
+    }
+    return null;
+}
+
+function extractHlsFromCallistanise(code, base) {
+    var sourceRefM = code.match(/(?:sources?|file)\s*:\s*(?:\[?\s*\{[^}]*(?:file|src)\s*:\s*)?([a-zA-Z_$][a-zA-Z0-9_$]{0,4})\s*\.\s*([a-zA-Z0-9_]+)\s*\|\|\s*\1\s*\.\s*([a-zA-Z0-9_]+)(?:\s*\|\|\s*\1\s*\.\s*([a-zA-Z0-9_]+))?/i);
+    if (sourceRefM) {
+        var varName = sourceRefM[1];
+        var keys = [sourceRefM[2], sourceRefM[3]];
+        if (sourceRefM[4]) keys.push(sourceRefM[4]);
+        var varRe = new RegExp('var\\s+' + varName.replace('$', '\\$') + '\\s*=\\s*(\\{[\\s\\S]{1,800}?\\})', 'i');
+        var vm = code.match(varRe);
+        if (vm) {
+            var vo = parseJsObjVh(vm[1]);
+            if (vo) {
+                var prefHls = pickPreferredHls(vo, base);
+                if (prefHls) return prefHls;
+                for (var ki = 0; ki < keys.length; ki++) {
+                    var kv = vo[keys[ki]];
+                    if (kv && kv.indexOf('.m3u8') !== -1) return makeAbsoluteVh(kv, base);
+                }
+                var fb = extractM3u8FromObjVh(vo, base);
+                if (fb) return fb;
+            }
+        }
+    }
+
+    var anyVarM = code.match(/var\s+([a-zA-Z_$][a-zA-Z0-9_$]{0,4})\s*=\s*(\{[^{}]{10,800}\})/g);
+    if (anyVarM) {
+        for (var vi = 0; vi < anyVarM.length; vi++) {
+            var vm2 = anyVarM[vi].match(/var\s+([a-zA-Z_$][a-zA-Z0-9_$]{0,4})\s*=\s*(\{[^{}]{10,800}\})/);
+            if (!vm2) continue;
+            if (!/m3u8|\.txt|\/hls/i.test(vm2[2])) continue;
+            var vo2 = parseJsObjVh(vm2[2]);
+            if (!vo2) continue;
+            var found = extractM3u8FromObjVh(vo2, base);
+            if (found) return found;
+        }
+    }
+
+    var fm = code.match(/(?:file)\s*:\s*["']([^"']+\.(?:m3u8|txt)[^"']*?)["']/i);
+    if (fm) return makeAbsoluteVh(fm[1], base);
+    var am = code.match(/(https?:\/\/[^"'\s\\]+\.(?:m3u8|txt)[^"'\s\\]*)/i);
+    if (am) return am[1];
+    return null;
+}
+
+// ==========================================
+// VALIDACIÓN DE CANDIDATOS (evita señuelos/publicidad)
+// ==========================================
+// Puerto de la lógica que encontramos en un fork de PeliApi: un regex que
+// matchea "algo con .m3u8" puede matchear perfectamente un link de
+// publicidad (vimos un caso real: un segmento servido desde un host de
+// TikTok CDN, con extensión .image, mezclado en medio de un master.m3u8
+// real). Antes de aceptar un candidato como bueno, lo bajamos de verdad y
+// chequeamos que sea un m3u8 real y que sus segmentos no vengan de un host
+// conocido de publicidad/tracking.
+function isSuspiciousSegmentUrl(url) {
+    try {
+        var parsed = new URL(url);
+        var host = parsed.hostname.toLowerCase();
+        var pathname = parsed.pathname.toLowerCase();
+        if (host === 'tiktokcdn.com' || host.endsWith('.tiktokcdn.com')) return true;
+        if (pathname.endsWith('.image') || pathname.indexOf('/ad-site-') !== -1) return true;
+        if (/\.(png|jpg|jpeg|webp|gif|svg|avif)$/i.test(pathname)) return true;
+        return false;
+    } catch (e) { return false; }
+}
+
+// NOTA: ya no se usa en el flujo de resolución (ver resolveStreamwishHls): bajar
+// el candidato otra vez quema tokens de un solo uso y marcaba como publicidad
+// los segmentos reales servidos como ".image" desde tiktokcdn. Se deja definida
+// solo por si hace falta para diagnóstico manual.
+async function validateHlsCandidate(candidateUrl, headers, depth) {
+    depth = depth || 0;
+    if (depth > 3) return null;
+    if (isSuspiciousSegmentUrl(candidateUrl)) return null;
+
+    var text;
+    try {
+        var r = await axios.get(candidateUrl, {
+            headers: headers,
+            timeout: 10000,
+            responseType: 'text',
+            transformResponse: [(d) => d],
+        });
+        text = r.data;
+    } catch (e) { return null; }
+
+    if (typeof text !== 'string' || !text.trimStart().startsWith('#EXTM3U')) return null;
+
+    var lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+
+    // Master playlist: bajamos a la mejor variante y validamos ESA, no el master.
+    if (text.indexOf('#EXT-X-STREAM-INF') !== -1) {
+        var bestUrl = null, bestScore = -1;
+        for (var i = 0; i < lines.length; i++) {
+            if (lines[i].indexOf('#EXT-X-STREAM-INF') === -1) continue;
+            var resM = /RESOLUTION=(\d+)x(\d+)/i.exec(lines[i]);
+            var score = resM ? Number(resM[1]) * Number(resM[2]) : 0;
+            for (var j = i + 1; j < lines.length; j++) {
+                if (lines[j].startsWith('#')) continue;
+                var variant = new URL(lines[j], candidateUrl).href;
+                if (score > bestScore) { bestScore = score; bestUrl = variant; }
+                break;
+            }
+        }
+        if (!bestUrl) return null;
+        return validateHlsCandidate(bestUrl, headers, depth + 1);
+    }
+
+    // Media playlist: solo rechazamos si TODOS los segmentos muestreados son
+    // sospechosos (señal de que este candidato es un señuelo completo, sin
+    // contenido real). Si aparece uno solo mezclado con reales, no lo
+    // descartamos: es normal que sitios con publicidad inserten un pre-roll
+    // como primer segmento del stream real (el reproductor lo pasa y sigue
+    // con el contenido real, como cualquier stream con anuncios).
+    var segLines = lines.filter((l) => !l.startsWith('#'));
+    if (segLines.length === 0) return null;
+    var sample = segLines.slice(0, 10);
+    var suspiciousCount = 0;
+    for (var s = 0; s < sample.length; s++) {
+        var segUrl = new URL(sample[s], candidateUrl).href;
+        if (isSuspiciousSegmentUrl(segUrl)) suspiciousCount++;
+    }
+    if (suspiciousCount === sample.length) {
+        console.warn('[SW] candidato rechazado, TODOS los segmentos muestreados son sospechosos (señuelo completo):', candidateUrl);
+        return null;
+    }
+    if (suspiciousCount > 0) {
+        console.log(`[SW] candidato aceptado con ${suspiciousCount}/${sample.length} segmentos de publicidad mezclados (pre-roll normal):`, candidateUrl);
+    }
+    return candidateUrl; // este es el nivel (master o variante) que hay que devolver, no el segmento
+}
+
+// Añadidos más dominios mutantes de Streamwish
+const EMBED_HOSTS = [
+    'streamwish', 'niramirus', 'filemoon', 'embedwish', 'vidhide',
+    'vidhideplus', 'wishfast', 'strwish', 'awish', 'flaswish',
+    'swdyu', 'embedrise', 'kerapoxy', 'smoothpre', 'fsdcmo',
+    'loadpre', 'doodstream', 'voe.sx', 'moon.watch',
+    'vidmoly', 'vudeo', 'mp4upload', 'vtube.to', 'upstream',
+    'hgplaycdn', 'medixiru'
+];
+
+function patchDtoE(url) {
+    return url.replace(/\/d\/([A-Za-z0-9]+)(\?|$|#)/, '/e/$1$2').replace(/\/d\/([A-Za-z0-9]+)$/, '/e/$1');
+}
+
+// ==========================================
+// PROXY DE HLS (m3u8 + segmentos)
+// ==========================================
+// Por qué existe esto: el master.m3u8 de hgplaycdn/hglamioz/etc lleva un token
+// atado a la IP y a los headers (Referer/Origin/UA) que lo "negociaron". Si le
+// entregamos esa URL cruda al reproductor (VLC, celular, PC), la petición sale
+// desde OTRA IP y el CDN la rechaza aunque los headers estén bien puestos.
+// Solución: nuestro propio servidor reproxea TODO (m3u8 y cada segmento .ts),
+// siempre con la misma IP/headers, y el reproductor solo habla con nosotros.
+
+// Token firmado: base64url(JSON) + "." + base64url(HMAC-SHA256(PROXY_SIGNING_KEY, esa parte)).
+// Lleva url, headers, acct (id de cuenta, lo pone el gateway) y title, y caduca a las 12 h.
+// El gateway verifica la misma firma con la misma clave.
+const TOKEN_TTL_SECONDS = 12 * 3600;
+function signTokenBody(body) {
+    return crypto.createHmac('sha256', PROXY_SIGNING_KEY).update(body).digest('base64url');
+}
+function encodeProxyToken(url, headers, meta) {
+    const payload = { url: url, headers: headers || {}, exp: Math.floor(Date.now() / 1000) + TOKEN_TTL_SECONDS };
+    if (meta && meta.acct) payload.acct = String(meta.acct);
+    if (meta && meta.title) payload.title = String(meta.title).slice(0, 100);
+    const body = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+    return body + '.' + signTokenBody(body);
+}
+
+function decodeProxyToken(token) {
+    try {
+        const t = String(token);
+        const i = t.lastIndexOf('.');
+        if (i < 1) return null;
+        const body = t.slice(0, i);
+        const given = Buffer.from(t.slice(i + 1));
+        const expected = Buffer.from(signTokenBody(body));
+        if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return null;
+        const p = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+        if (!p || typeof p.url !== 'string' || typeof p.exp !== 'number' || p.exp < Date.now() / 1000) return null;
+        return p;
+    } catch (e) { return null; }
+}
+
+// Construye la URL absoluta de nuestro proxy que le vamos a dar a Stremio/VLC
+// en vez de la URL cruda del CDN.
+function buildProxyPlaylistUrl(targetUrl, headers, meta) {
+    const token = encodeProxyToken(targetUrl, headers, meta);
+    return `${PLAYLIST_BASE_URL}/playlist/${token}/master.m3u8`;
+}
+
+// StreamWish nombra sus playlists .txt (master.txt, index-f1-v1-a1.txt,
+// iframes-...txt) y sus segmentos .woff2. Las .txt se tratan igual que las
+// .m3u8 (playlist -> proxy liviano, se reescribe); los .woff2 no son playlist,
+// así que siguen el camino de cualquier segmento (directo al CDN).
+function isM3u8Url(u) {
+    return /\.(m3u8|txt)(\?|#|$)/i.test(u);
+}
+
+// Hosts de publicidad/CDN público de TikTok: hay playlists (hls4) cuyos
+// segmentos reales viven ahí como ".image", firmados y con CORS abierto (*), o
+// sea que CUALQUIER cliente los baja directo. Aunque se use USE_PROXY=1 no
+// vale la pena gastar banda propia en ellos.
+var AD_HOSTS = [/(^|\.)tiktokcdn\.com$/i, /(^|\.)doubleclick\.net$/i, /(^|\.)googlesyndication\.com$/i];
+function isKnownAdHost(u) {
+    try {
+        var host = new URL(u).hostname.toLowerCase();
+        return AD_HOSTS.some(function (rx) { return rx.test(host); }) || u.toLowerCase().indexOf('/ad-site-') !== -1;
+    } catch (e) { return false; }
+}
+
+// USE_PROXY=1 -> proxy viejo completo (TODO pasa por nuestro servidor,
+//   incluidos los segmentos .ts -- máxima compatibilidad, máximo gasto de
+//   banda). Sirve de red de contención si algún proveedor puntual sí exige
+//   headers en los segmentos.
+// USE_PROXY sin setear (default) -> proxy "liviano": el manifest (.m3u8,
+//   texto, KB) pasa por nuestro servidor con los headers correctos, así
+//   funciona en CUALQUIER cliente (soluciona el bug de Android que no
+//   aplicaba bien proxyHeaders) -- pero los segmentos .ts (el video real,
+//   los GB) van directo al CDN, sin gastar banda nuestra.
+const USE_PROXY = process.env.USE_PROXY === '1';
+
+function buildStreamResult(name, description, targetUrl, headers, meta) {
+    const stream = {
+        name,
+        description,
+        url: buildProxyPlaylistUrl(targetUrl, headers, meta)
+    };
+    // Masters .txt (CDN de StreamWish en Cloudflare, con CORS atado al origen
+    // del embed): le pedimos a Stremio que mande Referer/Origin/UA desde el
+    // cliente al bajar los segmentos, sin pasar bytes por nuestro server.
+    // notWebReady => no funciona en Stremio Web (solo clientes con servidor local).
+    if (isM3u8Url(targetUrl) && /\.txt(\?|#|$)/i.test(targetUrl) && headers) {
+        stream.behaviorHints = { notWebReady: true, proxyHeaders: { request: Object.assign({}, headers) } };
+    }
+    return stream;
+}
+
+// Reescribe un playlist .m3u8: las sub-playlists (texto, KB) siguen pasando
+// por NUESTRO proxy, para garantizar que los headers se apliquen siempre
+// del lado del servidor (sin depender de que el cliente de Stremio los
+// mande bien -- que es justo lo que falla en Android). Pero los SEGMENTOS
+// (.ts, los GB reales, el costo de ancho de banda) van DIRECTO al CDN real,
+// sin pasar por nuestro proxy -- si el CDN no exige headers para servirlos
+// (como confirmamos en varios casos), el reproductor los baja solo, sin
+// gastarnos banda a nosotros.
+//
+// IMPORTANTE: no decidimos "sub-playlist vs segmento" por la EXTENSIÓN del
+// archivo (algunos sitios, como este, nombran sus sub-playlists con ".txt" en
+// vez de ".m3u8"), sino por la ETIQUETA que las precede en el propio m3u8:
+// #EXT-X-STREAM-INF siempre indica que la línea siguiente es una sub-playlist,
+// sin importar cómo se llame el archivo.
+function rewriteM3u8(playlistText, baseUrl, headers, meta) {
+    const lines = playlistText.split(/\r?\n/);
+    let nextIsPlaylist = false;
+
+    const out = lines.map((line) => {
+        const trimmed = line.trim();
+        if (!trimmed) return line;
+
+        if (trimmed.startsWith('#')) {
+            const upper = trimmed.toUpperCase();
+
+            // #EXT-X-I-FRAME-STREAM-INF trae su URI en la misma línea y SIEMPRE
+            // apunta a otra sub-playlist (no a un segmento binario).
+            if (upper.startsWith('#EXT-X-I-FRAME-STREAM-INF')) {
+                return line.replace(/URI="([^"]+)"/i, (m, uri) => {
+                    const abs = makeAbsoluteVh(uri, baseUrl.replace(/\/[^/]*$/, ''));
+                    const token = encodeProxyToken(abs, headers, meta);
+                    return `URI="${PLAYLIST_BASE_URL}/playlist/${token}/sub.m3u8"`;
+                });
+            }
+
+            // #EXT-X-KEY / #EXT-X-MAP: pesan casi nada (una clave o un header de
+            // inicialización), no vale la pena arriesgar que fallen sin headers
+            // -- siguen pasando por nuestro proxy de segmento (barato igual).
+            const rewritten = line.replace(/URI="([^"]+)"/i, (m, uri) => {
+                const abs = makeAbsoluteVh(uri, baseUrl.replace(/\/[^/]*$/, ''));
+                const token = encodeProxyToken(abs, headers, meta);
+                return `URI="${PLAYLIST_BASE_URL}/segment/${token}/seg"`;
+            });
+
+            // Si esta etiqueta es #EXT-X-STREAM-INF, la línea SIGUIENTE (sin #)
+            // va a ser una sub-playlist, aunque su nombre de archivo no diga m3u8.
+            nextIsPlaylist = upper.startsWith('#EXT-X-STREAM-INF');
+            return rewritten;
+        }
+
+        // Línea de URI real (segmento o sub-playlist)
+        const absUrl = /^https?:\/\//i.test(trimmed)
+            ? trimmed
+            : makeAbsoluteVh(trimmed, baseUrl.replace(/\/[^/]*$/, ''));
+        const isPlaylist = nextIsPlaylist || isM3u8Url(absUrl);
+        nextIsPlaylist = false;
+
+        if (isPlaylist) {
+            const token = encodeProxyToken(absUrl, headers, meta);
+            return `${PLAYLIST_BASE_URL}/playlist/${token}/sub.m3u8`;
+        }
+        // Segmento real: por default va DIRECTO al CDN (no gasta banda
+        // nuestra). Con USE_PROXY=1 también pasa por nuestro proxy, por si
+        // algún proveedor puntual exige headers en los segmentos.
+        if (USE_PROXY && !isKnownAdHost(absUrl)) {
+            const token = encodeProxyToken(absUrl, headers, meta);
+            return `${PLAYLIST_BASE_URL}/segment/${token}/seg`;
+        }
+        return absUrl;
+    });
+    return out.join('\n');
+}
+
+async function handleHlsPlaylistProxy(req, res) {
+    const data = decodeProxyToken(req.params.token);
+    if (!data) return res.status(400).send('Token inválido');
+
+    try {
+        await assertPublicTargetDns(data.url);
+        const upstream = await axios.get(data.url, {
+            headers: data.headers,
+            timeout: 15000,
+            responseType: 'text',
+            transformResponse: [(d) => d],
+            ...PROXY_NET_OPTS
+        });
+        const rewritten = rewriteM3u8(upstream.data, data.url, data.headers, { acct: data.acct, title: data.title });
+        res.set('Access-Control-Allow-Origin', '*');
+        res.set('Content-Type', 'application/vnd.apple.mpegurl');
+        res.send(rewritten);
+    } catch (e) {
+        console.log('Playlist no disponible:', e.message);
+        res.status(502).send('No se pudo obtener el playlist');
+    }
+}
+
+async function handleHlsSegmentProxy(req, res) {
+    const data = decodeProxyToken(req.params.token);
+    if (!data) return res.status(400).send('Token inválido');
+
+    try {
+        await assertPublicTargetDns(data.url);
+        const upstream = await axios.get(data.url, {
+            headers: data.headers,
+            timeout: 20000,
+            responseType: 'stream',
+            ...PROXY_NET_OPTS
+        });
+        res.set('Access-Control-Allow-Origin', '*');
+        if (upstream.headers['content-type']) res.set('Content-Type', upstream.headers['content-type']);
+        upstream.data.pipe(res);
+    } catch (e) {
+        res.status(502).send('No se pudo obtener el segmento');
+    }
+}
+
+function isEmbedHost(url) {
+    for (var i = 0; i < EMBED_HOSTS.length; i++) {
+        if (url.indexOf(EMBED_HOSTS[i]) !== -1) return true;
+    }
+    return false;
+}
+
+function parseDownloadTable(html) {
+    var results = [];
+    var dlRe = /<tr><td><span[^>]*>[^<]*<\/span>\s*([^<]+?)\s*<\/td><td>([^<]+)<\/td><td>[^<]*<span>([^<]+)<\/span>[^<]*<\/td><td><a[^>]+href="(https?:\/\/player\.poseidonhd2\.co\/download\.php[^"]+)"/gi;
+    var langMap = { 'latino': 'Latino', 'español': 'Español', 'castellano': 'Español', 'subtitulado': 'Subtitulado', 'english': 'Subtitulado' };
+    var m;
+    while ((m = dlRe.exec(html)) !== null) {
+        var serverRaw = m[1].replace(/^\s+|\s+$/g, '').toLowerCase();
+        if (serverRaw !== 'streamwish') continue;
+        var langRaw = m[2].replace(/^\s+|\s+$/g, '').toLowerCase();
+        var lang = langMap[langRaw] || m[2].replace(/^\s+|\s+$/g, '');
+        var quality = m[3].replace(/^\s+|\s+$/g, '') || 'HD';
+        results.push({ playerUrl: m[4], label: 'Streamwish · ' + lang + ' · ' + quality + ' (DL)' });
+    }
+    return results;
+}
+
+function parseCliLiStreams(html) {
+    var results = [];
+    var langMap = { 'español latino': 'Latino', 'latino': 'Latino', 'español': 'Español', 'castellano': 'Español', 'subtitulado': 'Subtitulado', 'english': 'Subtitulado' };
+    var groupRe = /_1R6bW_0"[^>]*>\s*<span>([^<]+)[\s\S]*?sub-tab-lang[^"]*"([\s\S]*?)<\/ul>/gi;
+    var gm;
+    while ((gm = groupRe.exec(html)) !== null) {
+        var langRaw = gm[1].replace(/^\s+|\s+$/g, '').toLowerCase();
+        var lang = langMap[langRaw] || (langRaw ? (langRaw.charAt(0).toUpperCase() + langRaw.slice(1)) : 'Latino');
+        var block = gm[2];
+        var cliliRe = /data-tr="([^"]+)"[^>]*>[\s\S]*?<span[^>]*>\s*([^<]+)\s*<\/span>/gi;
+        var cm;
+        while ((cm = cliliRe.exec(block)) !== null) {
+            var playerUrl = cm[1];
+            var text = cm[2].replace(/^\s+|\s+$/g, '');
+            var serverMatch = text.match(/^\d+\.\s*([^\s-]+)/i);
+            if (!serverMatch) continue;
+            var serverName = serverMatch[1].toLowerCase();
+            if (serverName !== 'vidhide' && serverName !== 'vidhideplus') continue;
+            var qualMatch = text.match(/-\s*(\S+)\s*$/i);
+            var quality = qualMatch ? qualMatch[1] : 'HD';
+            var displayName = serverName === 'vidhideplus' ? 'VidHidePlus' : 'VidHide';
+            results.push({ playerUrl: playerUrl, label: displayName + ' · ' + lang + ' · ' + quality });
+        }
+    }
+    return results;
+}
+
+function normPsTitle(s) {
+    return s.toLowerCase().replace(/[áàäâ]/g, 'a').replace(/[éèëê]/g, 'e').replace(/[íìïî]/g, 'i').replace(/[óòöô]/g, 'o').replace(/[úùüû]/g, 'u').replace(/ñ/g, 'n').replace(/[^a-z0-9 ]/g, ' ').replace(/ +/g, ' ').replace(/^ | $/g, '');
+}
+
+var PS_STOP = { 'de':1,'la':1,'el':1,'los':1,'las':1,'un':1,'una':1,'en':1,'y':1,'a':1,'the':1,'of':1,'and':1,'del':1,'le':1,'les':1,'des':1,'da':1,'o':1,'e':1 };
+
+function scorePsResult(qWords, tn) {
+    if (!qWords.length) return 50;
+    var tWords = tn.split(' ');
+    var matched = 0;
+    for (var qi = 0; qi < qWords.length; qi++) {
+        var qw = qWords[qi];
+        for (var ti = 0; ti < tWords.length; ti++) {
+            var tw = tWords[ti];
+            if (!tw) continue;
+            if (qw === tw) { matched++; break; }
+            if (qw.length >= 5 && tw.length >= 5) {
+                var shorter = qw.length <= tw.length ? qw : tw;
+                var longer = qw.length <= tw.length ? tw : qw;
+                if (longer.indexOf(shorter) === 0 && shorter.length * 10 >= longer.length * 8) { matched++; break; }
+            }
+        }
+    }
+    return Math.floor(matched * 80 / qWords.length);
+}
+
+// Elige, DENTRO de los resultados del tipo correcto (película o serie), el que
+// mejor puntaje de coincidencia tenga contra el título buscado — en vez de tomar
+// ciegamente el primero que aparezca en el orden que devolvió el sitio. Esto es
+// clave cuando el filtro global ya descartó todo por diferencia de idioma y
+// caímos al fallback de orden crudo, donde el primero de un tipo no siempre es
+// el correcto (ver caso "Dragon Goes House-Hunting" vs "La casa del dragón").
+function pickBestPsMatch(results, query, expectedPath) {
+    if (!results || results.length === 0) return null;
+    var qn = normPsTitle(query);
+    var qRaw = qn.split(' ');
+    var qWords = [];
+    for (var i = 0; i < qRaw.length; i++) {
+        if (qRaw[i].length > 2 && !PS_STOP[qRaw[i]]) qWords.push(qRaw[i]);
+    }
+
+    var candidates = expectedPath ? results.filter(r => r.url.indexOf(expectedPath) !== -1) : results;
+    if (candidates.length === 0) candidates = results;
+
+    var best = candidates[0];
+    var bestScore = -1;
+    for (var j = 0; j < candidates.length; j++) {
+        var tn = normPsTitle(candidates[j].title);
+        var score = (qn === tn) ? 100 : scorePsResult(qWords, tn);
+        if (score > bestScore) { bestScore = score; best = candidates[j]; }
+    }
+    return best;
+}
+
+function filterPsResults(results, query) {
+    var qn = normPsTitle(query);
+    var qRaw = qn.split(' ');
+    var qWords = [];
+    for (var i = 0; i < qRaw.length; i++) {
+        if (qRaw[i].length > 2 && !PS_STOP[qRaw[i]]) qWords.push(qRaw[i]);
+    }
+    var scored = [];
+    for (var j = 0; j < results.length; j++) {
+        var tn = normPsTitle(results[j].title);
+        var score;
+        if (qn === tn) score = 100;
+        else if (tn.indexOf(qn) === 0 && (tn.length === qn.length || tn.charAt(qn.length) === ' ')) score = 90;
+        else score = scorePsResult(qWords, tn);
+        if (score >= 40) scored.push({ r: results[j], score: score });
+    }
+    scored.sort((a, b) => b.score - a.score);
+    // Si nuestro filtrado por palabras no encontró nada (típico cuando el título
+    // que buscamos está en un idioma distinto al indexado por el sitio), confiamos
+    // en el orden que ya nos dio el buscador de Poseidon en vez de devolver vacío.
+    if (scored.length === 0) return results;
+    return scored.map(s => s.r);
+}
+
+function parseNextData(html) {
+    var nm = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]+?)<\/script>/);
+    if (!nm) return null;
+    try {
+        let data = JSON.parse(nm[1]);
+        return (data && data.props && data.props.pageProps) ? data.props.pageProps : null;
+    } catch(e) { return null; }
+}
+
+
+// ==========================================
+// FUNCIONES ASÍNCRONAS (SCRAPERS)
+// ==========================================
+async function resolveVidHideHls(url) {
+    var fileId = null;
+    var dm = url.match(/https?:\/\/filelions\.(?:to|tv|com)\/v\/([A-Za-z0-9]+)/i);
+    if (dm) {
+        fileId = dm[1];
+    } else if (url.indexOf('player.poseidonhd2') !== -1 || url.indexOf('player.php') !== -1) {
+        var playerHtml;
+        try {
+            playerHtml = (await axios.get(url, { headers: PS_UA, timeout: 8000 })).data;
+        } catch(e) { return null; }
+        var m = playerHtml.match(/['"]https?:\/\/filelions\.(?:to|tv|com)\/v\/([A-Za-z0-9]+)['"]/i);
+        if (!m) return null;
+        fileId = m[1];
+    } else {
+        return null;
+    }
+
+    var base = 'https://callistanise.com';
+    var calliPaths = ['/embed/', '/v/'];
+    for (var pi = 0; pi < calliPaths.length; pi++) {
+        var calliUrl = base + calliPaths[pi] + fileId;
+        var calliHtml;
+        try {
+            calliHtml = (await axios.get(calliUrl, {
+                headers: { 'User-Agent': PS_UA['User-Agent'], 'Referer': 'https://filelions.to/' },
+                timeout: 8000
+            })).data;
+        } catch(e) { continue; }
+        
+        var calliHeaders = { 'Referer': calliUrl, 'Origin': base, 'User-Agent': PS_UA['User-Agent'] };
+        var em = calliHtml.match(/\}\s*\(\s*'([\s\S]+?)',\s*(\d+),\s*(\d+),\s*'([\s\S]+?)'\s*\.split\('\\\|'\)\s*\)/im);
+        if (em && em[1] !== undefined && em[2] !== undefined && em[3] !== undefined && em[4] !== undefined) {
+            var decoded = unpackJsVh(em[1], parseInt(em[2], 10), parseInt(em[3], 10), em[4].split('|'));
+            var hls = extractHlsFromCallistanise(decoded, base);
+            if (hls) return { url: hls, headers: calliHeaders };
+        }
+        var hls2 = extractHlsFromCallistanise(calliHtml, base);
+        if (hls2) return { url: hls2, headers: calliHeaders };
+    }
+    return null;
+}
+
+// --- COMIENZA EL CÓDIGO MODIFICADO ---
+
+async function resolveEmbedUrl(poseidonUrl) {
+    var html;
+    try {
+        html = (await axios.get(poseidonUrl, { headers: PS_UA, timeout: 8000 })).data;
+    } catch(e) { return null; }
+
+    // Regex agresivo: busca cualquier estructura "/e/ID" o "/embed/ID" sin importar el dominio
+    var patterns = [
+        /window\.location(?:\.href)?\s*=\s*['"]([^'"]+)['"]/i,
+        /location\.replace\s*\(\s*['"]([^'"]+)['"]\s*\)/i,
+        /<meta[^>]+http-equiv\s*=\s*['"]refresh['"][^>]+content\s*=\s*['"][^'">\s]+url=([^'">\s]+)/i,
+        /src\s*=\s*['"]((?:https?:)?\/\/[^'"]+\/(?:e|embed|v)\/[a-zA-Z0-9]+[^'"]*)['"]/i,
+        /(https?:\/\/[^\s'"<>\\]+\/(?:e|embed|v)\/[a-zA-Z0-9]+[^\s'"<>\\]*)/i
+    ];
+
+    for (var i = 0; i < patterns.length; i++) {
+        var m = html.match(patterns[i]);
+        if (m && m[1]) return m[1];
+    }
+    return null;
+}
+
+// Detecta si un HTML de un embed hace una redirección client-side (JS o meta refresh)
+// hacia otro dominio "mutante" (ej: streamwish.to/e/ID -> niramirus.com/e/ID)
+function findMutantRedirect(html, base) {
+    var patterns = [
+        /window\.location(?:\.href)?\s*=\s*['"]([^'"]+)['"]/i,
+        /location\.replace\s*\(\s*['"]([^'"]+)['"]\s*\)/i,
+        /<meta[^>]+http-equiv\s*=\s*['"]refresh['"][^>]+content\s*=\s*['"][^'">\s]+url=([^'">\s]+)/i,
+        /<iframe[^>]+src\s*=\s*['"]([^'"]+\/(?:e|embed)\/[a-zA-Z0-9]+[^'"]*)['"]/i
+    ];
+    for (var i = 0; i < patterns.length; i++) {
+        var m = html.match(patterns[i]);
+        if (m && m[1]) return makeAbsoluteVh(m[1], base);
+    }
+    return null;
+}
+
+// Extrae y desempaqueta cualquier bloque eval(function(p,a,c,k,e,d)...) presente en un HTML
+function unpackEvalBlocks(html) {
+    var evalRegex = /eval\(\s*function\s*\(p,a,c,k,e,[rd]\)[\s\S]*?\}\s*\(\s*'([\s\S]*?)'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*'([\s\S]*?)'\s*\.split\('\|'\)/g;
+    var match;
+    var unpacked = '';
+    while ((match = evalRegex.exec(html)) !== null) {
+        var p = match[1];
+        var a = parseInt(match[2], 10);
+        var c = parseInt(match[3], 10);
+        var k = match[4].split('|');
+        unpacked += '\n' + unpackJsVh(p, a, c, k);
+    }
+    return unpacked;
+}
+
+// NUEVO: resolvedor específico para la familia Streamwish (streamwish, niramirus,
+// embedwish, vidhideplus-clones, filemoon, etc). Sigue la redirección client-side
+// hasta el dominio "mutante" final y desempaqueta el player para sacar el m3u8 real.
+async function resolveStreamwishHls(embedUrl) {
+    var visited = {};
+    var currentUrl = embedUrl;
+    var refererOrigin = 'https://www.google.com/';
+
+    for (var hop = 0; hop < 4; hop++) {
+        if (visited[currentUrl]) break;
+        visited[currentUrl] = true;
+
+        var res;
+        try {
+            res = await axios.get(currentUrl, {
+                headers: { ...PS_UA, 'Referer': refererOrigin },
+                timeout: 10000
+            });
+        } catch (e) { return null; }
+
+        var html = res.data;
+        var finalUrl = (res.request && res.request.res && res.request.res.responseUrl) || currentUrl;
+        var origin = new URL(finalUrl).origin;
+
+        // 1. Intentar sacar el m3u8 directo del HTML/scripts desempaquetados de esta página
+        var unpacked = unpackEvalBlocks(html);
+        var hls = extractHlsFromCallistanise(unpacked + '\n' + html, origin);
+        if (hls) {
+            // Sin pre-validar (validateHlsCandidate ya no se usa acá): estas URLs
+            // traen tokens firmados de vida corta y algunos son de un solo uso, así
+            // que bajarlas otra vez "para validar" quema el token o dispara un
+            // rechazo del CDN, y de paso descartaba streams legítimos: los
+            // segmentos reales de varios CDNs (morencius, acek-cdn) se sirven como
+            // ".image" desde tiktokcdn, y el chequeo los marcaba como publicidad.
+            // Se confía en lo que el resolver extrajo del sitio real.
+            var candidateHeaders = { 'Referer': origin + '/', 'Origin': origin, 'User-Agent': PS_UA['User-Agent'] };
+            return { url: hls, headers: candidateHeaders };
+        }
+
+        // 2. Si no hay video todavía, ver si la página redirige a un dominio mutante
+        var nextUrl = findMutantRedirect(html, origin);
+        if (!nextUrl || nextUrl === currentUrl) return null;
+
+        currentUrl = nextUrl;
+        refererOrigin = origin + '/';
+    }
+    return null;
+}
+
+// ==========================================
+// RESOLUCIÓN CON NAVEGADOR HEADLESS (Puppeteer)
+// ==========================================
+// Necesario porque streamwish.to/e/ID NO redirige por HTTP ni por un
+// window.location.href simple visible en el HTML: el cambio de dominio
+// (ej. -> niramirus.com/e/ID) y la carga del .m3u8 ocurren mediante JS
+// ejecutado en el navegador (fetch/XHR internos, DOM dinámico, etc).
+// axios nunca va a "verlo" porque no ejecuta JavaScript.
+// La única forma confiable es abrir la página en un navegador real
+// (headless) e interceptar la petición de red hacia el .m3u8 cuando
+// el propio player la dispara, tal como pasa cuando lo abrís tú mismo.
+
+let _browserInstance = null;
+async function getBrowser() {
+    if (_browserInstance && _browserInstance.isConnected()) return _browserInstance;
+    _browserInstance = await puppeteer.launch({
+        headless: 'new',
+        protocolTimeout: 30000, // antes no estaba seteado -> podía colgarse minutos
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu'
+        ]
+    });
+    return _browserInstance;
+}
+
+// Límite de concurrencia para Puppeteer: con poca RAM, dos o más
+// resoluciones abriendo pestañas al mismo tiempo en el mismo Chromium
+// compartido pueden saturarlo y producir "Target.createTarget timed out".
+// Con esto, si ya hay una resolución de Puppeteer en curso, las demás
+// esperan su turno en vez de pelear por recursos al mismo tiempo.
+let _puppeteerQueue = Promise.resolve();
+function withPuppeteerLock(fn) {
+    const run = _puppeteerQueue.then(fn, fn);
+    // Encadenamos el "next" ignorando el resultado/error de este turno, para
+    // que un fallo en una resolución no trabe la cola para las siguientes.
+    _puppeteerQueue = run.then(() => undefined, () => undefined);
+    return run;
+}
+
+// Resuelve el .m3u8 real abriendo el embed en un navegador headless,
+// siguiendo todos los saltos de dominio que haga el propio JS del sitio,
+// e interceptando la request de red hacia el .m3u8 cuando se dispare.
+async function _resolveStreamwishHlsViaBrowserInner(embedUrl, timeoutMs, trace) {
+    timeoutMs = timeoutMs || 20000;
+    let browser;
+    let page;
+    let onTargetCreated;
+    const t = (msg) => { if (trace) trace.push('[' + (Date.now() - tStart) + 'ms] ' + msg); };
+    const tStart = Date.now();
+    try {
+        browser = await getBrowser();
+        page = await browser.newPage();
+        await page.setUserAgent(PS_UA['User-Agent']);
+        await page.setRequestInterception(true);
+
+        let resolved = null;
+        let lastRefererByUrl = 'https://www.google.com/';
+        let requestCount = 0;
+        const seenHosts = new Set();
+        // El navegador manda Origin = origen de la PÁGINA que pide el video (p.ej.
+        // https://vibuxer.com), no el del CDN. Los CDNs con CORS atado al embed
+        // (StreamWish .txt) lo necesitan tal cual, así que lo derivamos del Referer.
+        let pageOrigin = null;
+        try { pageOrigin = new URL(embedUrl).origin; } catch (e) {}
+        const originFromReferer = (referer) => {
+            if (referer) { try { return new URL(referer).origin; } catch (e) {} }
+            return pageOrigin;
+        };
+
+        onTargetCreated = async (target) => {
+            try {
+                if (target.opener() === page.target()) {
+                    t('Se abrió una pestaña nueva (popup/ad), cerrándola');
+                    const popup = await target.page();
+                    if (popup) await popup.close();
+                }
+            } catch (e) { /* noop */ }
+        };
+        browser.on('targetcreated', onTargetCreated);
+
+        page.on('request', (req) => {
+            const url = req.url();
+            requestCount++;
+            try { seenHosts.add(new URL(url).host); } catch (e) {}
+            const type = req.resourceType();
+            // OJO: NO abortamos 'media' — el propio <video> puede pedir el .m3u8
+            // o los segmentos directamente como resourceType 'media' (sin pasar
+            // por hls.js/XHR), y si lo abortamos nunca vemos esa URL ni el video
+            // llega a reproducir de verdad. Solo cortamos imágenes/fuentes.
+            if (type === 'image' || type === 'font') {
+                req.abort();
+                return;
+            }
+            if (/\.m3u8/i.test(url)) t('Request con ".m3u8" en la URL (resourceType=' + type + '): ' + url);
+            if (type === 'xhr' || type === 'fetch' || (type === 'media' && !/\.(png|jpg|jpeg|gif|webp|svg)(\?|$)/i.test(url))) {
+                t('[' + type + '] ' + url);
+            }
+            if (!resolved && /\.m3u8(\?|$)/i.test(url)) {
+                resolved = {
+                    url: url,
+                    headers: {
+                        'Referer': req.headers()['referer'] || lastRefererByUrl,
+                        'Origin': originFromReferer(req.headers()['referer'] || lastRefererByUrl),
+                        'User-Agent': PS_UA['User-Agent']
+                    }
+                };
+                t('¡MATCH! m3u8 capturado (por URL): ' + url);
+            }
+            req.continue();
+        });
+
+        page.on('response', async (resp) => {
+            if (resolved) return;
+            try {
+                const ct = resp.headers()['content-type'] || '';
+                const rUrl = resp.url();
+                if (/mpegurl|vnd\.apple\.mpegurl|dash\+xml/i.test(ct)) {
+                    resolved = {
+                        url: rUrl,
+                        headers: {
+                            'Referer': resp.request().headers()['referer'] || lastRefererByUrl,
+                            'Origin': originFromReferer(resp.request().headers()['referer'] || lastRefererByUrl),
+                            'User-Agent': PS_UA['User-Agent']
+                        }
+                    };
+                    t('¡MATCH! Manifiesto detectado por content-type "' + ct + '": ' + rUrl);
+                }
+            } catch (e) { /* noop */ }
+        });
+
+        page.on('console', (msg) => {
+            if (trace && /error|denied|blocked/i.test(msg.text())) t('console.' + msg.type() + ': ' + msg.text().slice(0, 200));
+        });
+
+        page.on('framenavigated', (frame) => {
+            if (frame === page.mainFrame()) {
+                lastRefererByUrl = frame.url();
+                t('Navegó a: ' + frame.url());
+            }
+        });
+
+        t('Iniciando goto a ' + embedUrl);
+        try {
+            await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: timeoutMs, referer: 'https://www.google.com/' });
+            t('goto completó (domcontentloaded)');
+        } catch (e) {
+            t('goto tiró error/timeout: ' + e.message);
+        }
+
+        const viewport = page.viewport() || { width: 1280, height: 720 };
+        const centerX = Math.floor(viewport.width / 2);
+        const centerY = Math.floor(viewport.height / 2);
+
+        const start = Date.now();
+        let lastClickAt = 0;
+        let clickRound = 0;
+        while (!resolved && Date.now() - start < timeoutMs) {
+            if (Date.now() - lastClickAt > 2000) {
+                lastClickAt = Date.now();
+                clickRound++;
+                try {
+                    await page.mouse.click(centerX, centerY);
+                    t('Click #' + clickRound + ' en el centro (' + centerX + ',' + centerY + ')');
+                } catch (e) { t('Error al clickear centro: ' + e.message); }
+                try {
+                    const clickedSelector = await page.evaluate(() => {
+                        const el = document.querySelector('video, .jw-icon-playback, .vjs-big-play-button, .play-button, #player, .plyr__control--overlaid');
+                        if (el) { el.click(); return el.tagName + (el.className ? '.' + el.className : ''); }
+                        return null;
+                    });
+                    if (clickedSelector) t('Click directo sobre elemento: ' + clickedSelector);
+                } catch (e) { /* noop */ }
+            }
+            await new Promise(r => setTimeout(r, 300));
+        }
+
+        t('Fin del loop. Requests totales vistos: ' + requestCount + '. Hosts: ' + [...seenHosts].join(', '));
+        if (!resolved) {
+            try {
+                const title = await page.title();
+                const bodyText = await page.evaluate(() => document.body ? document.body.innerText.slice(0, 300) : '');
+                t('Título de la página: ' + title);
+                t('Texto visible (primeros 300 chars): ' + bodyText);
+            } catch (e) { /* noop */ }
+        }
+
+        return resolved;
+    } catch (e) {
+        t('ERROR general: ' + e.message);
+        if (/timed out|Target closed|Connection closed|Protocol error/i.test(e.message || '')) {
+            console.warn('[SW] Browser compartido parece roto, se descarta para relanzar uno limpio la próxima vez:', e.message);
+            try { if (_browserInstance) await _browserInstance.close(); } catch (_e) {}
+            _browserInstance = null;
+        }
+        return null;
+    } finally {
+        if (browser && onTargetCreated) {
+            try { browser.off('targetcreated', onTargetCreated); } catch (e) {}
+        }
+        if (page) {
+            try { await page.close(); } catch (e) {}
+        }
+    }
+}
+
+// Wrapper público: corre la resolución vía Puppeteer a través del semáforo
+// (withPuppeteerLock), para que dos resoluciones no peleen por el mismo
+// Chromium compartido al mismo tiempo.
+async function resolveStreamwishHlsViaBrowser(embedUrl, timeoutMs, trace) {
+    return withPuppeteerLock(() => _resolveStreamwishHlsViaBrowserInner(embedUrl, timeoutMs, trace));
+}
+
+// ACTUALIZADO: Retorna no solo la URL, sino también las cabeceras necesarias
+async function resolveDirectVideoUrl(embedUrl) {
+    try {
+        // Obtenemos la página final (siguiendo redirecciones)
+        const res = await axios.get(embedUrl, { 
+            headers: { ...PS_UA, 'Referer': 'https://www.google.com/' }, 
+            timeout: 10000 
+        });
+        
+        let html = res.data;
+        const finalUrl = res.request.res.responseUrl || embedUrl;
+        const origin = new URL(finalUrl).origin;
+
+        // Intentar unpack (si el sitio está ofuscado)
+        const unpackedExtra = unpackEvalBlocks(html);
+        const unpackedHtml = html + '\n' + unpackedExtra;
+
+        // Buscar enlaces m3u8 o mp4 (regex corregida: \s ya no excluye la letra "s")
+        const fileRegex = /(?:file|src|source)\s*:\s*["'](https?:\/\/[^"'\s]+\.(?:m3u8|mp4)[^"'\s]*)['"]/i;
+        const linkMatch = unpackedHtml.match(fileRegex);
+        
+        if (linkMatch) {
+            return {
+                url: linkMatch[1],
+                headers: { "Referer": origin + '/', "Origin": origin, "User-Agent": PS_UA['User-Agent'] }
+            };
+        }
+    } catch (err) {
+        return null;
+    }
+    return null;
+}
+
+// --- TERMINA EL CÓDIGO MODIFICADO ---
+
+async function searchPoseidon2hd(q) {
+    var html;
+    try {
+        html = (await axios.get('https://www.poseidonhd2.co/search?q=' + encodeURIComponent(q), { headers: PS_UA, timeout: 8000 })).data;
+    } catch(e) { return []; }
+
+    var results = [];
+    var seen = {};
+    var liRe = /<li[^>]+class="[^"]*TPostMv[^"]*"[^>]*>([\s\S]*?)<\/li>/gi;
+    var item;
+    while ((item = liRe.exec(html)) !== null) {
+        var block = item[1];
+        var aMatch = block.match(/<a\s[^>]*href="(\/pelicula\/[^"]+|\/serie\/[^"]+)"/i);
+        if (!aMatch) continue;
+        var url = 'https://www.poseidonhd2.co' + aMatch[1];
+        if (seen[url]) continue;
+        seen[url] = true;
+
+        var tMatch = block.match(/<span[^>]+class="[^"]*Title[^"]*block[^"]*"[^>]*>([^<]+)<\/span>/i);
+        if (!tMatch) tMatch = block.match(/<span[^>]+class="[^"]*block[^"]*Title[^"]*"[^>]*>([^<]+)<\/span>/i);
+        if (!tMatch) continue;
+        var title = tMatch[1].replace(/&amp;/g, '&').replace(/&#39;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').trim();
+        if (!title) continue;
+
+        results.push({ title: title, url: url });
+    }
+    return filterPsResults(results, q);
+}
+
+async function fetchPoseidonHD2Streams(url, trace) {
+    var html;
+    try {
+        html = (await axios.get(url, { headers: PS_UA, timeout: 8000 })).data;
+        if (trace) trace.push('Fetch OK a ' + url + ' (largo HTML: ' + html.length + ')');
+    } catch(e) {
+        if (trace) trace.push('ERROR fetching ' + url + ': ' + (e.code || e.message) + (e.response ? (' status=' + e.response.status) : ''));
+        return null;
+    }
+
+    var pp = parseNextData(html);
+    if (!pp) {
+        if (trace) trace.push('parseNextData no encontró __NEXT_DATA__ o no pudo parsear el JSON');
+        return null;
+    }
+    if (trace) trace.push('parseNextData OK, keys de pageProps: ' + Object.keys(pp).join(', '));
+
+    var subject = pp.thisMovie || pp.thisEpisode || pp.episode || null;
+    if (!subject) {
+        if (trace) trace.push('Ni pp.thisMovie ni pp.thisEpisode existen en pageProps');
+        return null;
+    }
+    if (trace) trace.push('subject encontrado, keys: ' + Object.keys(subject).join(', '));
+
+    var videos = subject.videos || {};
+    if (trace) trace.push('subject.videos: ' + JSON.stringify(videos).slice(0, 800));
+    var streams = [];
+    var langMap = { spanish: 'Español', latino: 'Latino', english: 'Subtitulado' };
+    var langs = ['spanish', 'latino', 'english'];
+
+    for (var li = 0; li < langs.length; li++) {
+        var lang = langs[li];
+        var entries = videos[lang] || [];
+        for (var ei = 0; ei < entries.length; ei++) {
+            var e = entries[ei];
+            if (!e.result) continue;
+            if (e.cyberlocker === 'streamwish' || e.cyberlocker === 'vidhide') {
+                var serverName = e.cyberlocker === 'streamwish' ? 'Streamwish' : 'VidHide';
+                streams.push({ playerUrl: e.result, label: `${serverName} · ${langMap[lang]} · ${e.quality || 'HD'}` });
+            }
+        }
+    }
+
+    var dlStreams = parseDownloadTable(html);
+    var cliStreams = parseCliLiStreams(html);
+    if (trace) trace.push('streams de videos[]: ' + streams.length + ', de tabla de descarga: ' + dlStreams.length + ', de cli: ' + cliStreams.length);
+
+    streams = streams.concat(dlStreams).concat(cliStreams);
+    return { streams: streams };
+}
+
+async function fetchPoseidonHD2Series(url) {
+    var html;
+    try {
+        html = (await axios.get(url, { headers: PS_UA, timeout: 8000 })).data;
+    } catch(e) { return null; }
+
+    var pp = parseNextData(html);
+    if (!pp) return null;
+
+    var subject = pp.thisSerie || null;
+    if (!subject) return null;
+
+    var slugMatch = url.match(/\/serie\/\d+\/([^/?#]+)/);
+    return {
+        tmdbId: subject.TMDbId ? subject.TMDbId.toString() : null,
+        slug: slugMatch ? slugMatch[1] : null
+    };
+}
+
+async function fetchPoseidonHD2Episode(tmdbId, slug, season, episode, trace) {
+    var url = `https://www.poseidonhd2.co/serie/${tmdbId}/${slug}/temporada/${season}/episodio/${episode}`;
+    return await fetchPoseidonHD2Streams(url, trace);
+}
+
+
+// ==========================================
+// INTEGRACIÓN CON STREMIO ADDON SDK
+// ==========================================
+const manifest = {
+    id: "org.poseidonhd2.stremio",
+    version: "1.0.0",
+    name: "PoseidonHD2",
+    description: "Películas y Series en Español/Latino obtenidas de PoseidonHD",
+    catalogs: [],
+    resources: ["stream"],
+    types: ["movie", "series"],
+    idPrefixes: ["tt"] 
+};
+
+const builder = new addonBuilder(manifest);
+
+// Stremio suele reintentar automáticamente si un pedido de stream tarda
+// mucho en responder -- eso dispara TODO el pipeline de nuevo (incluyendo
+// otro navegador Puppeteer), duplicando el trabajo y compitiendo por los
+// mismos recursos, lo cual paradójicamente hace que todo tarde AÚN MÁS
+// (un círculo vicioso). Para cortarlo: si llega un pedido idéntico
+// (mismo type+id) mientras ya hay uno igual en curso, esperamos el MISMO
+// resultado en vez de arrancar todo de nuevo desde cero.
+const inFlightRequests = new Map();
+
+builder.defineStreamHandler(async (args) => {
+    // La cuenta la pone el gateway (X-Account-Id) y llega por el contexto de la petición.
+    const store = acctStore.getStore();
+    const acct = store && store.acct;
+    if (!acct) return { streams: [] };
+    // la clave incluye la cuenta: dos cuentas nunca comparten una resolución en curso
+    const requestKey = `${acct}|${args.type}:${args.id}`;
+    if (inFlightRequests.has(requestKey)) {
+        console.log(`Pedido duplicado detectado para ${requestKey} -- reusando la resolución en curso en vez de arrancar otra.`);
+        return inFlightRequests.get(requestKey);
+    }
+
+    const resultPromise = resolveStreamRequest(args, acct);
+    inFlightRequests.set(requestKey, resultPromise);
+    try {
+        return await resultPromise;
+    } finally {
+        inFlightRequests.delete(requestKey);
+    }
+});
+
+async function resolveStreamRequest(args, acct) {
+    const [imdbId, season, episode] = args.id.split(':');
+    const meta = { acct, title: args.id };
+    
+    // Cinemeta puede darnos varias variantes de título (nombre original en inglés,
+    // y a veces alternativos). Probamos varias para no depender de un solo idioma.
+    let titleCandidates = [];
+    let tmdbIdFromMeta = null;
+    try {
+        const metaRes = await axios.get(`https://v3-cinemeta.strem.io/meta/${args.type}/${imdbId}.json`);
+        const meta = metaRes.data && metaRes.data.meta;
+        if (meta) {
+            if (meta.moviedb_id) tmdbIdFromMeta = String(meta.moviedb_id);
+            if (meta.name) titleCandidates.push(meta.name);
+            if (Array.isArray(meta.aka)) titleCandidates = titleCandidates.concat(meta.aka);
+            if (meta.slug) {
+                const fromSlug = meta.slug.replace(/-\d{4}$/, '').replace(/-/g, ' ').trim();
+                if (fromSlug) titleCandidates.push(fromSlug);
+            }
+        }
+    } catch (e) {
+        console.log("No se pudo obtener meta de cinemeta para", imdbId);
+        return { streams: [] };
+    }
+
+    // El ID de TMDB es la forma más confiable de identificar el contenido
+    // (determinístico, no depende de idioma ni de coincidencias de texto).
+    // Lo pedimos directo a la API de TMDB primero (más confiable que
+    // depender de que Cinemeta lo tenga cargado), y si eso falla, usamos el
+    // que trajo Cinemeta como respaldo.
+    const tmdbResult = await getTmdbId(imdbId, args.type);
+    const tmdbId = tmdbResult.id || tmdbIdFromMeta;
+    console.log(`imdbId=${imdbId} type=${args.type} tmdbId=${tmdbId} esTitle=${tmdbResult.esTitle}`);
+
+    titleCandidates = [...new Set(titleCandidates.filter(Boolean))];
+    // Agregamos el título en español (es-MX) de TMDB como candidato -- el
+    // buscador de Poseidon es en español, así que buscar en inglés a veces
+    // no encuentra nada aunque el contenido sí esté en el sitio. Lo probamos
+    // primero, ya que es más probable que encuentre resultados relevantes.
+    if (tmdbResult.esTitle) titleCandidates = [tmdbResult.esTitle, ...titleCandidates.filter(t => t !== tmdbResult.esTitle)];
+    if (titleCandidates.length === 0) return { streams: [] };
+
+    console.log('Candidatos de título a probar:', JSON.stringify(titleCandidates));
+    // Juntamos los resultados de TODOS los candidatos (no solo el primero que
+    // traiga algo), porque el match final es por ID de TMDB exacto -- así que
+    // conviene tener el pool más grande posible de resultados donde buscar.
+    let searchResults = [];
+    let usedCandidate = null;
+    const seenUrls = new Set();
+    // Las 3 búsquedas se hacen en PARALELO (no una por una) para no perder
+    // tiempo -- la latencia de red es lo que domina acá, así que en paralelo
+    // el total tarda lo que tarda la más lenta, no la suma de las 3.
+    const allResults = await Promise.all(titleCandidates.map(candidate =>
+        searchPoseidon2hd(candidate).then(results => {
+            console.log(`Búsqueda con "${candidate}" -> ${results.length} resultado(s): ` + JSON.stringify(results.map(r => r.url)));
+            return { candidate, results };
+        })
+    ));
+    for (const { candidate, results } of allResults) {
+        for (const r of results) {
+            if (!seenUrls.has(r.url)) {
+                seenUrls.add(r.url);
+                searchResults.push(r);
+            }
+        }
+        if (!usedCandidate && results.length > 0) usedCandidate = candidate;
+    }
+    const expectedPath = args.type === 'series' ? '/serie/' : '/pelicula/';
+
+    if (!searchResults || searchResults.length === 0) {
+        // El buscador de Poseidon no encontró NADA con ningún candidato de
+        // título -- pasa con estrenos muy recientes que el buscador interno
+        // todavía no indexó, aunque la página ya exista. Como Poseidon usa el
+        // ID de TMDB en sus URLs (/pelicula/{tmdbId}/{slug}/), si lo tenemos
+        // armamos la URL directo y probamos ahí antes de rendirnos.
+        if (tmdbId) {
+            const guessTitle = (tmdbResult && tmdbResult.esTitle) || usedCandidate || (titleCandidates[0]);
+            const guessSlug = slugify(guessTitle);
+            const guessUrl = `https://www.poseidonhd2.co${expectedPath}${tmdbId}/${guessSlug}/`;
+            console.log(`Sin resultados de búsqueda -- probando URL directa por TMDB ID: ${guessUrl}`);
+            searchResults = [{ url: guessUrl, title: guessTitle }];
+            usedCandidate = guessTitle;
+        } else {
+            return { streams: [] };
+        }
+    }
+
+    // Entre los resultados del tipo correcto (película o serie), buscamos un
+    // match EXACTO por ID de TMDB.
+    //
+    // IMPORTANTE: si tenemos un tmdbId confirmado y NINGÚN resultado de la
+    // búsqueda lo tiene, NO caemos al matching por palabras -- eso fue lo que
+    // causaba el bug de devolver una serie totalmente distinta cuando la
+    // buscada no está en Poseidon. Si Poseidon usa IDs de TMDB en sus URLs y
+    // no encontramos ese ID exacto, lo más probable es que ese contenido
+    // simplemente no esté en el sitio, así que preferimos devolver vacío.
+    // El matching por palabras queda solo como último recurso para el caso
+    // (raro) en que ni siquiera tengamos un tmdbId disponible.
+    let target = null;
+    if (tmdbId) {
+        const idRegex = new RegExp(expectedPath + tmdbId + '(?:/|$)');
+        target = searchResults.find(r => idRegex.test(r.url)) || null;
+        if (!target) {
+            console.log(`TMDB ID ${tmdbId} no encontrado en los resultados de Poseidon -- no se arriesga con un match por palabras.`);
+            return { streams: [] };
+        }
+    } else {
+        target = pickBestPsMatch(searchResults, usedCandidate, expectedPath);
+    }
+    if (!target) return { streams: [] };
+
+    let poseidonData = null;
+
+    if (args.type === 'movie') {
+        poseidonData = await fetchPoseidonHD2Streams(target.url);
+    } else if (args.type === 'series') {
+        const seriesData = await fetchPoseidonHD2Series(target.url);
+        if (seriesData && seriesData.tmdbId && seriesData.slug) {
+            poseidonData = await fetchPoseidonHD2Episode(seriesData.tmdbId, seriesData.slug, season, episode);
+        }
+    }
+
+    if (!poseidonData || !poseidonData.streams) return { streams: [] };
+
+    const stremioStreams = await Promise.all(poseidonData.streams.map(async (s) => {
+        let cleanLabel = s.label.replace(' (DL)', '');
+        
+        // 1. Resolver VidHide
+        if (s.label.toLowerCase().includes('vidhide')) {
+            const vhData = await resolveVidHideHls(s.playerUrl);
+            
+            if (vhData && vhData.url) {
+                return buildStreamResult(
+                    "PoseidonHD",
+                    cleanLabel,
+                    vhData.url,
+                    vhData.headers,
+                    meta
+                );
+            }
+        }
+
+        // 2. Resolver Embeds (Streamwish, Medixiru, etc)
+        const embedUrl = await resolveEmbedUrl(s.playerUrl);
+        if (embedUrl) {
+            // 2a. Intento rápido (sin navegador): sirve para hosts que sí redirigen
+            //     con un window.location simple o ya traen el m3u8 en el HTML plano.
+            const swDataFast = await resolveStreamwishHls(embedUrl);
+            if (swDataFast && swDataFast.url) {
+                return buildStreamResult(
+                    "PoseidonHD",
+                    cleanLabel + "\n(Directo)",
+                    swDataFast.url,
+                    swDataFast.headers,
+                    meta
+                );
+            }
+
+            // 2b. Intento con navegador headless: necesario cuando el salto de
+            //     dominio (streamwish.to -> niramirus.com, etc) y la carga del
+            //     m3u8 solo ocurren ejecutando el JS real del sitio, y el
+            //     camino rápido (2a) no encontró nada validable.
+            const swDataBrowser = await resolveStreamwishHlsViaBrowser(embedUrl);
+            if (swDataBrowser && swDataBrowser.url) {
+                return buildStreamResult(
+                    "PoseidonHD",
+                    cleanLabel + "\n(Directo)",
+                    swDataBrowser.url,
+                    swDataBrowser.headers,
+                    meta
+                );
+            }
+
+            // 2c. Intento genérico legacy (por si acaso)
+            const directData = await resolveDirectVideoUrl(embedUrl);
+            if (directData && directData.url) {
+                return buildStreamResult(
+                    "PoseidonHD",
+                    cleanLabel + "\n(Directo)",
+                    directData.url,
+                    directData.headers,
+                    meta
+                );
+            }
+            
+            // Backup por si falla toda la extracción: si aun así preferís
+            // no mostrar streams "External Web", cambiá el return de abajo por `return null;`
+            return {
+                name: "PoseidonHD",
+                description: cleanLabel + "\n(External Web)",
+                externalUrl: embedUrl
+            };
+        }
+
+        return null;
+    }));
+
+    return { streams: stremioStreams.filter(stream => stream !== null) };
+}
+
+const port = process.env.PORT || 7000;
+
+const app = express();
+
+// Backend cerrado: TODAS las rutas exigen el secreto que pone el gateway.
+// Se responde 404 (no 401) para no delatar que aquí hay algo.
+const GATEWAY_SECRET_HASH = crypto.createHash('sha256').update(GATEWAY_SECRET).digest();
+app.use((req, res, next) => {
+    const got = crypto.createHash('sha256').update(String(req.get('X-Gateway-Secret') || '')).digest();
+    if (!crypto.timingSafeEqual(got, GATEWAY_SECRET_HASH)) return res.status(404).send('Not found');
+    const acct = String(req.get('X-Account-Id') || '');
+    acctStore.run({ acct: /^[A-Za-z0-9_-]{1,40}$/.test(acct) ? acct : '' }, next);
+});
+
+app.get('/hlsproxy/playlist/:token/*', handleHlsPlaylistProxy);
+app.get('/hlsproxy/segment/:token/*', handleHlsSegmentProxy);
+
+// --- DIAGNÓSTICO TEMPORAL para series ---
+// Uso: /debug/series?imdb=tt0000000&season=1&episode=1
+// --- DIAGNÓSTICO TEMPORAL para embeds tipo streamwish ---
+// Uso: /debug/embed?url=<link de streamwish.to/e/xxxx o similar>
+// Rutas de diagnóstico: apagadas por defecto. Solo existen con ENABLE_DEBUG=1
+// (y, como todo el backend, siguen exigiendo el secreto del gateway).
+if (ENABLE_DEBUG) {
+    app.get('/debug/embed', async (req, res) => {
+        const embedUrl = req.query.url;
+        if (!embedUrl) return res.status(400).send('Falta ?url=');
+
+        res.set('Content-Type', 'text/plain');
+        const trace = [];
+        const result = await resolveStreamwishHlsViaBrowser(embedUrl, 25000, trace);
+        res.send(trace.join('\n') + '\n\nRESULTADO FINAL: ' + JSON.stringify(result));
+    });
+    // --- FIN DIAGNÓSTICO TEMPORAL ---
+
+    // --- DIAGNÓSTICO TEMPORAL para embeds de Streamwish/hglamioz/playnixes/etc ---
+    // Uso: /debug/streamwish?url=<embed url completa, ej: https://hgplaycdn.com/e/xxxx>
+    app.get('/debug/streamwish', async (req, res) => {
+        const embedUrl = req.query.url;
+        if (!embedUrl) return res.status(400).send('Falta ?url=<embed completa>');
+        res.set('Content-Type', 'text/plain');
+
+        const trace = [];
+        const result = await resolveStreamwishHlsViaBrowser(embedUrl, 25000, trace);
+
+        let fetchTest = 'no se intentó (no hubo resultado)';
+        if (result && result.url) {
+            const t0 = Date.now();
+            try {
+                const r = await axios.get(result.url, {
+                    headers: result.headers,
+                    timeout: 10000,
+                    validateStatus: () => true,
+                    responseType: 'text',
+                    transformResponse: [(d) => d],
+                });
+                const ms = Date.now() - t0;
+                const preview = typeof r.data === 'string' ? r.data.slice(0, 300) : '(no-texto)';
+                fetchTest = `HTTP ${r.status} en ${ms}ms, pedido ${(Date.now() - t0)}ms después de resolver.\nPrimeros 300 chars del body:\n${preview}`;
+
+                // Si el master.m3u8 se pudo leer, seguimos la cadena: sub-playlist
+                // (con y sin headers) y el primer segmento .ts (con y sin headers),
+                // para saber EXACTAMENTE qué nivel exige los headers.
+                if (r.status === 200 && typeof r.data === 'string') {
+                    const lines = r.data.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+                    const subLine = lines.find((l) => !l.startsWith('#'));
+                    if (subLine) {
+                        const subUrl = new URL(subLine, result.url).href;
+
+                        const subWith = await axios.get(subUrl, { headers: result.headers, timeout: 10000, validateStatus: () => true, responseType: 'text', transformResponse: [(d) => d] });
+                        const subWithout = await axios.get(subUrl, { timeout: 10000, validateStatus: () => true, responseType: 'text', transformResponse: [(d) => d] });
+                        fetchTest += `\n\nSub-playlist (${subUrl}):\n  CON headers -> HTTP ${subWith.status}\n  SIN headers -> HTTP ${subWithout.status}`;
+
+                        if (subWith.status === 200 && typeof subWith.data === 'string') {
+                            const subLines = subWith.data.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+                            const segLine = subLines.find((l) => !l.startsWith('#'));
+                            if (segLine) {
+                                const segUrl = new URL(segLine, subUrl).href;
+                                const segWith = await axios.get(segUrl, { headers: result.headers, timeout: 10000, validateStatus: () => true, responseType: 'arraybuffer' });
+                                const segWithout = await axios.get(segUrl, { timeout: 10000, validateStatus: () => true, responseType: 'arraybuffer' });
+                                fetchTest += `\n\nSegmento .ts (${segUrl}) [ojo: puede ser un pre-roll de publicidad si el sitio inserta anuncios, no es necesariamente el contenido real]:\n  CON headers -> HTTP ${segWith.status} (${segWith.data ? segWith.data.length : 0} bytes)\n  SIN headers -> HTTP ${segWithout.status} (${segWithout.data ? segWithout.data.length : 0} bytes)`;
+                            }
+                        }
+                    }
+                }
+            } catch (e) {
+                fetchTest = `Fetch falló: ${e.message}`;
+            }
+        }
+
+        res.send(
+            trace.join('\n') +
+            '\n\nResultado final: ' + (result ? JSON.stringify(result) : 'null (cayó a External Web)') +
+            '\n\n--- Test de fetch inmediato desde ESTE server, mismos headers ---\n' + fetchTest
+        );
+    });
+
+    app.get('/debug/movie', async (req, res) => {
+        const imdbId = req.query.imdb;
+        if (!imdbId) return res.status(400).json({ error: 'Falta ?imdb=ttXXXXXXX' });
+        try {
+            const result = await resolveStreamRequest({ type: 'movie', id: imdbId });
+            res.json(result);
+        } catch (e) {
+            res.status(500).json({ error: e.message, stack: e.stack });
+        }
+    });
+
+    app.get('/debug/series', async (req, res) => {
+        const imdbId = req.query.imdb;
+        const season = req.query.season || '1';
+        const episode = req.query.episode || '1';
+        if (!imdbId) return res.status(400).send('Falta ?imdb=ttXXXXXXX');
+
+        res.set('Content-Type', 'text/plain');
+        const log = [];
+        const p = (label, val) => log.push(label + ': ' + (typeof val === 'object' ? JSON.stringify(val) : val));
+
+        try {
+            const metaRes = await axios.get(`https://v3-cinemeta.strem.io/meta/series/${imdbId}.json`);
+            const meta = metaRes.data && metaRes.data.meta;
+            p('Meta name', meta && meta.name);
+            p('Meta slug', meta && meta.slug);
+            p('Meta aka', meta && meta.aka);
+            p('Meta moviedb_id (TMDB)', meta && meta.moviedb_id);
+            const tmdbIdFromMeta = meta && meta.moviedb_id ? String(meta.moviedb_id) : null;
+
+            let titleCandidates = [];
+            if (meta) {
+                if (meta.name) titleCandidates.push(meta.name);
+                if (Array.isArray(meta.aka)) titleCandidates = titleCandidates.concat(meta.aka);
+                if (meta.slug) {
+                    const fromSlug = meta.slug.replace(/-\d{4}$/, '').replace(/-/g, ' ').trim();
+                    if (fromSlug) titleCandidates.push(fromSlug);
+                }
+            }
+            titleCandidates = [...new Set(titleCandidates.filter(Boolean))];
+            p('Candidatos de título', titleCandidates);
+
+            let searchResults = [];
+            let usedCandidate = null;
+            for (const candidate of titleCandidates) {
+                searchResults = await searchPoseidon2hd(candidate);
+                p('Búsqueda con "' + candidate + '" dio resultados', searchResults.map(r => r.title + ' -> ' + r.url));
+                if (searchResults && searchResults.length > 0) { usedCandidate = candidate; break; }
+            }
+
+            if (!searchResults || searchResults.length === 0) {
+                return res.send(log.join('\n') + '\n\nNO se encontró NADA en ninguna variante de título.');
+            }
+
+            const expectedPath = '/serie/';
+            let target = null;
+            if (tmdbIdFromMeta) {
+                const idRegex = new RegExp(expectedPath + tmdbIdFromMeta + '(?:/|$)');
+                target = searchResults.find(r => idRegex.test(r.url)) || null;
+                p('Match exacto por TMDB ID (' + tmdbIdFromMeta + ')', target ? target.url : 'NO encontrado');
+            }
+            if (!target) target = pickBestPsMatch(searchResults, usedCandidate, expectedPath);
+            if (!target) return res.send(log.join('\n') + '\n\nNo se encontró ningún resultado.');
+            p('Target elegido', target.url + ' (título: ' + target.title + ')');
+
+            const seriesData = await fetchPoseidonHD2Series(target.url);
+            p('seriesData (tmdbId/slug)', seriesData);
+
+            if (!seriesData || !seriesData.tmdbId || !seriesData.slug) {
+                return res.send(log.join('\n') + '\n\nfetchPoseidonHD2Series no devolvió tmdbId/slug válidos.');
+            }
+
+            const episodeUrl = `https://www.poseidonhd2.co/serie/${seriesData.tmdbId}/${seriesData.slug}/temporada/${season}/episodio/${episode}`;
+            p('URL de episodio construida', episodeUrl);
+
+            const poseidonData = await fetchPoseidonHD2Episode(seriesData.tmdbId, seriesData.slug, season, episode, log);
+            p('poseidonData.streams', poseidonData && poseidonData.streams);
+
+            res.send(log.join('\n'));
+        } catch (e) {
+            p('ERROR', e.message);
+            res.status(500).send(log.join('\n'));
+        }
+    });
+    // --- FIN DIAGNÓSTICO TEMPORAL ---
+
+    // Test de red simple y directo (sin navegador) para ver si el origen responde
+    // bien a nuestro proxy y qué contenido/status trae realmente.
+    // Uso: /debug/nettest?url=<tu link completo de /hlsproxy/playlist/TOKEN/master.m3u8>
+    app.get('/debug/nettest', async (req, res) => {
+        const proxyUrl = req.query.url;
+        if (!proxyUrl) return res.status(400).send('Falta el parámetro ?url=');
+
+        const m = proxyUrl.match(/\/hlsproxy\/playlist\/([^/]+)\//);
+        if (!m) return res.status(400).send('Esa URL no es un link de /hlsproxy/playlist/...');
+
+        const data = decodeProxyToken(m[1]);
+        if (!data) return res.status(400).send('No se pudo decodificar el token');
+
+        res.set('Content-Type', 'text/plain');
+        const start = Date.now();
+        try {
+            const upstream = await axios.get(data.url, {
+                headers: data.headers,
+                timeout: 12000,
+                responseType: 'text',
+                transformResponse: [(d) => d],
+                validateStatus: () => true
+            });
+            res.send(
+                'URL: ' + data.url +
+                '\nTiempo: ' + (Date.now() - start) + 'ms' +
+                '\nStatus: ' + upstream.status +
+                '\nHeaders respuesta: ' + JSON.stringify(upstream.headers, null, 2) +
+                '\n\nPrimeros 800 caracteres del body:\n' + String(upstream.data).slice(0, 800)
+            );
+        } catch (e) {
+            res.send(
+                'URL: ' + data.url +
+                '\nTiempo hasta el error: ' + (Date.now() - start) + 'ms' +
+                '\nError code: ' + (e.code || 'N/A') +
+                '\nError message: ' + e.message
+            );
+        }
+    });
+}
+
+app.use(getRouter(builder.getInterface()));
+
+app.listen(port, () => {
+    console.log(`Addon de Stremio escuchando en puerto ${port}`);
+    console.log(`Playlists por el gateway: ${PLAYLIST_BASE_URL}`);
+});
+
+async function shutdown() {
+    if (_browserInstance) {
+        try { await _browserInstance.close(); } catch (e) {}
+    }
+    process.exit(0);
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
