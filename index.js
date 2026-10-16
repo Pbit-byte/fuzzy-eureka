@@ -429,6 +429,17 @@ function isKnownAdHost(u) {
 //   los GB) van directo al CDN, sin gastar banda nuestra.
 const USE_PROXY = process.env.USE_PROXY === '1';
 
+// Marca visible: los nombres reales de los servidores no se muestran al usuario.
+//   Streamwish -> Servidor 1      VidHide / VidHidePlus -> Servidor 2
+// Solo se aplica a la etiqueta que se MUESTRA. La lógica interna (por ejemplo decidir si un
+// enlace se resuelve como VidHide) sigue usando la etiqueta original, sin renombrar.
+function brandServerLabel(label) {
+    return String(label)
+        .replace(/^\s*vidhideplus\b/i, 'Servidor 2')
+        .replace(/^\s*vidhide\b/i, 'Servidor 2')
+        .replace(/^\s*streamwish\b/i, 'Servidor 1');
+}
+
 function buildStreamResult(name, description, targetUrl, headers, meta) {
     const stream = {
         name,
@@ -1209,8 +1220,10 @@ async function fetchPoseidonHD2Episode(tmdbId, slug, season, episode, trace) {
 const manifest = {
     id: "org.poseidonhd2.stremio",
     version: "1.0.0",
-    name: "PoseidonHD2",
-    description: "Películas y Series en Español/Latino obtenidas de PoseidonHD",
+    name: "Shen",
+    description: "Películas y Series en Español/Latino",
+    // El logo lo sirve el gateway (el backend está cerrado al público): mismo dominio que PLAYLIST_BASE_URL.
+    logo: new URL(PLAYLIST_BASE_URL).origin + "/assets/shen.png",
     catalogs: [],
     resources: ["stream"],
     types: ["movie", "series"],
@@ -1375,6 +1388,7 @@ async function resolveStreamRequest(args, acct) {
 
     const stremioStreams = await Promise.all(poseidonData.streams.map(async (s) => {
         let cleanLabel = s.label.replace(' (DL)', '');
+        const shownLabel = brandServerLabel(cleanLabel);   // solo para mostrar; el enrutado usa la etiqueta original
         
         // 1. Resolver VidHide
         if (s.label.toLowerCase().includes('vidhide')) {
@@ -1382,8 +1396,8 @@ async function resolveStreamRequest(args, acct) {
             
             if (vhData && vhData.url) {
                 return buildStreamResult(
-                    "PoseidonHD",
-                    cleanLabel,
+                    "Shen",
+                    shownLabel,
                     vhData.url,
                     vhData.headers,
                     meta
@@ -1399,8 +1413,8 @@ async function resolveStreamRequest(args, acct) {
             const swDataFast = await resolveStreamwishHls(embedUrl);
             if (swDataFast && swDataFast.url) {
                 return buildStreamResult(
-                    "PoseidonHD",
-                    cleanLabel + "\n(Directo)",
+                    "Shen",
+                    shownLabel + "\n(Directo)",
                     swDataFast.url,
                     swDataFast.headers,
                     meta
@@ -1414,8 +1428,8 @@ async function resolveStreamRequest(args, acct) {
             const swDataBrowser = await resolveStreamwishHlsViaBrowser(embedUrl);
             if (swDataBrowser && swDataBrowser.url) {
                 return buildStreamResult(
-                    "PoseidonHD",
-                    cleanLabel + "\n(Directo)",
+                    "Shen",
+                    shownLabel + "\n(Directo)",
                     swDataBrowser.url,
                     swDataBrowser.headers,
                     meta
@@ -1426,8 +1440,8 @@ async function resolveStreamRequest(args, acct) {
             const directData = await resolveDirectVideoUrl(embedUrl);
             if (directData && directData.url) {
                 return buildStreamResult(
-                    "PoseidonHD",
-                    cleanLabel + "\n(Directo)",
+                    "Shen",
+                    shownLabel + "\n(Directo)",
                     directData.url,
                     directData.headers,
                     meta
@@ -1437,8 +1451,8 @@ async function resolveStreamRequest(args, acct) {
             // Backup por si falla toda la extracción: si aun así preferís
             // no mostrar streams "External Web", cambiá el return de abajo por `return null;`
             return {
-                name: "PoseidonHD",
-                description: cleanLabel + "\n(External Web)",
+                name: "Shen",
+                description: shownLabel + "\n(External Web)",
                 externalUrl: embedUrl
             };
         }
